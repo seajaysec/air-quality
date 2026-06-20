@@ -459,7 +459,9 @@
     <div class="overall-divider"></div>
     <div class="overall-message" id="overallMessage">
       Enter your sensor values to see a combined air quality risk assessment.
-      CO2 is weighted lower due to cooking volatility.
+      The overall score follows the worst health-relevant pollutant (like the
+      EPA AQI), rising further when several are elevated. CO2 is contextual and
+      never sets the category on its own.
     </div>
   </div>
 
@@ -494,8 +496,10 @@ const SENSORS = [
       { max: 9999, label: 'High - Ventilate',     color: '#ef4444', bg: 'rgba(239,68,68,0.12)'   },
     ],
     spectrum: ['#4ade80','#a3e635','#facc15','#f97316','#ef4444'],
-    description: `CO2 is a proxy for ventilation quality. Outdoor air is ~420 ppm. Levels above <span class="threshold">1000 ppm</span> reduce cognitive performance measurably. Above <span class="threshold">1500 ppm</span> you may notice stuffiness. Cooking can temporarily spike readings to 1000-2000+ ppm - these transient spikes are contextual and not heavily weighted in long-term risk.`,
+    description: `CO2 is a proxy for ventilation quality. Outdoor air is ~420 ppm. Levels above <span class="threshold">1000 ppm</span> reduce cognitive performance measurably. Above <span class="threshold">1500 ppm</span> you may notice stuffiness. Cooking can temporarily spike readings to 1000-2000+ ppm - these transient spikes are contextual and not heavily weighted in long-term risk. CO2 is not part of the EPA AQI, so it never sets the overall category on its own - it only adds to cumulative load.`,
     weight: 0.8,
+    subFloor: 400,   // clean outdoor baseline for sub-index interpolation
+    hazardMax: 5000, // ppm mapped to the top of the index (OSHA PEL region)
   },
   {
     id: 'pm25', name: 'PM2.5', unit: 'ug/m³',
@@ -510,6 +514,7 @@ const SENSORS = [
     spectrum: ['#4ade80','#a3e635','#facc15','#f97316','#ef4444'],
     description: `Fine particles under 2.5 microns penetrate deep into lung tissue and enter the bloodstream. Primary driver of wildfire smoke risk. EPA "Good" is under <span class="threshold">12 ug/m³</span>, WHO guideline is <span class="threshold">5 ug/m³</span> annual mean. Long-term sustained exposure above 35 carries cumulative cardiovascular and respiratory risk.`,
     weight: 1.5,
+    hazardMax: 250, // EPA "Hazardous" 24h region (ug/m³) mapped to top of index
   },
   {
     id: 'pm10', name: 'PM10', unit: 'ug/m³',
@@ -524,6 +529,7 @@ const SENSORS = [
     spectrum: ['#4ade80','#a3e635','#facc15','#f97316','#ef4444'],
     description: `Coarser particles (under 10 microns) are filtered by the nose and throat more effectively than PM2.5, but sustained exposure still irritates airways. EPA Moderate threshold is <span class="threshold">54 ug/m³</span>. Dust, pollen, mold spores, and large smoke particles contribute here.`,
     weight: 0.9,
+    hazardMax: 425, // EPA "Hazardous" 24h region (ug/m³) mapped to top of index
   },
   {
     id: 'pm1', name: 'PM1.0', unit: 'ug/m³',
@@ -537,6 +543,7 @@ const SENSORS = [
     spectrum: ['#4ade80','#a3e635','#facc15','#ef4444'],
     description: `Ultrafine particles under 1 micron - the smallest fraction most sensors can detect. These pass almost entirely through respiratory defenses and enter systemic circulation. No formal EPA standard yet, but research links this fraction to cardiovascular and neurological effects. Concern begins around <span class="threshold">10-15 ug/m³</span> sustained.`,
     weight: 1.2,
+    hazardMax: 100, // no formal standard; high-concern ceiling (ug/m³)
   },
   {
     id: 'tvoc', name: 'TVOC', unit: 'mg/m³',
@@ -551,6 +558,7 @@ const SENSORS = [
     spectrum: ['#4ade80','#a3e635','#facc15','#f97316','#ef4444'],
     description: `Total Volatile Organic Compounds - composite reading of chemical off-gassing from paints, furnishings, cleaning products, and adhesives. "Good" is below <span class="threshold">0.3 mg/m³</span>. Sources include new furniture, fresh paint, floor finishes, and some cooking. Chronic exposure above 1.0 mg/m³ warrants source investigation and increased ventilation.`,
     weight: 1.0,
+    hazardMax: 5.0, // mg/m³; well into the "unacceptable" range mapped to top
   },
   {
     id: 'hcho', name: 'HCHO', unit: 'mg/m³',
@@ -564,6 +572,7 @@ const SENSORS = [
     spectrum: ['#4ade80','#facc15','#f97316','#ef4444'],
     description: `Formaldehyde - a known carcinogen off-gassed by pressed-wood products (MDF, plywood), insulation, carpet, and some fabrics. WHO guideline is <span class="threshold">0.1 mg/m³</span> for 30-minute exposure. California Prop 65 chronic concern threshold is around <span class="threshold">0.016 mg/m³</span>. New furniture and renovations commonly spike this temporarily.`,
     weight: 1.3,
+    hazardMax: 0.3, // mg/m³; ~3x the WHO 30-min guideline mapped to top
   },
 ];
 
@@ -585,26 +594,77 @@ function getCursorPct(sensor, value) {
   return Math.max(1, Math.min(99, pct * 100));
 }
 
-function getSensorRisk(sensor, value) {
+// Map each threshold color to a severity level (0=Good .. 4=worst). Using the
+// color keeps severity consistent even for sensors that skip a tier color
+// (e.g. PM1 has no orange, HCHO has no lime).
+const SEV_BY_COLOR = {
+  '#4ade80': 0, // green  - Good
+  '#a3e635': 1, // lime   - Acceptable / Moderate
+  '#facc15': 2, // yellow - Elevated / USG
+  '#f97316': 3, // orange - Unhealthy
+  '#ef4444': 4, // red    - Very Unhealthy / Hazardous
+};
+
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+
+// Continuous 0-100 sub-index for one sensor, EPA-style: piecewise-linear
+// interpolation between concentration breakpoints, with each severity tier
+// occupying a fixed 20-point band so the number lines up with the tier color.
+// This replaces the old coarse "tier index / tier count" step function, which
+// jumped in 25% increments and ignored where within a tier the value fell.
+function getSensorSub(sensor, value) {
   if (value === null || isNaN(value)) return null;
-  const idx = sensor.thresholds.findIndex(t => value <= t.max);
-  const tierIdx = idx === -1 ? sensor.thresholds.length - 1 : idx;
-  return (tierIdx / (sensor.thresholds.length - 1)) * 100;
+  let cLo = sensor.subFloor ?? 0;
+  const tiers = sensor.thresholds;
+  for (let i = 0; i < tiers.length; i++) {
+    const t = tiers[i];
+    const sev = SEV_BY_COLOR[t.color] ?? i;
+    const iLo = sev * 20, iHi = iLo + 20;
+    // Open-ended top tier (max 9999) interpolates up to the sensor hazard ceiling.
+    const cHi = t.max >= 9999 ? (sensor.hazardMax ?? cLo) : t.max;
+    if (value <= t.max || i === tiers.length - 1) {
+      const frac = cHi > cLo ? (value - cLo) / (cHi - cLo) : 0;
+      return clamp(iLo + frac * (iHi - iLo), 0, 100);
+    }
+    cLo = cHi;
+  }
+  return 100;
 }
 
+// Overall risk. Two real-world principles instead of a flat average:
+//   1. Dominant pollutant (US EPA AQI): the worst HEALTH-relevant sub-index
+//      sets the floor, so the overall category can never be milder than the
+//      worst sensor. CO2 is contextual (ventilation proxy, cooking-volatile,
+//      not in the AQI) so it is excluded from the floor.
+//   2. Cumulative load (Canada AQHI): co-elevated pollutants add real risk, so
+//      a bounded weighted bump from the *other* sensors is added on top.
 function computeOverall() {
-  let totalW = 0, weightedRisk = 0, filled = 0;
+  const subs = [];
   SENSORS.forEach(s => {
     const v = state[s.id];
     if (v === null || isNaN(v)) return;
-    const risk = getSensorRisk(s, v);
-    if (risk === null) return;
-    filled++;
-    totalW += s.weight;
-    weightedRisk += risk * s.weight;
+    const sub = getSensorSub(s, v);
+    if (sub === null) return;
+    subs.push({ sensor: s, sub, weight: s.weight });
   });
-  if (filled === 0) return null;
-  return { score: weightedRisk / totalW, filled };
+  if (!subs.length) return null;
+
+  // Dominant pollutant: worst non-contextual sensor (fall back to all if the
+  // only readings entered are contextual, e.g. CO2 alone).
+  let pool = subs.filter(x => !x.sensor.contextual);
+  if (!pool.length) pool = subs;
+  const dominant = pool.reduce((a, b) => (b.sub > a.sub ? b : a));
+
+  // Cumulative bump from everything except the dominant sensor, weighted and
+  // capped so it nudges (never replaces) the dominant floor.
+  const totalW = subs.reduce((a, b) => a + b.weight, 0);
+  const secLoad = subs
+    .filter(x => x !== dominant)
+    .reduce((a, b) => a + b.sub * b.weight, 0) / totalW;
+  const bump = Math.min(15, secLoad * 0.3);
+
+  const score = clamp(dominant.sub + bump, 0, 100);
+  return { score, filled: subs.length, dominant, bump, subs };
 }
 
 function scoreColor(score) {
@@ -624,7 +684,7 @@ function scoreLabel(score) {
 }
 
 function buildMessage(result) {
-  if (!result) return 'Enter your sensor values to see a combined air quality risk assessment. CO2 is weighted lower due to cooking volatility.';
+  if (!result) return 'Enter your sensor values to see a combined air quality risk assessment. The overall score follows the worst health-relevant pollutant (like the EPA AQI), rising further when several are elevated. CO2 is contextual and never sets the category on its own.';
   const s = result.score;
   const co2 = state.co2;
   const pm25 = state.pm25;
@@ -634,7 +694,14 @@ function buildMessage(result) {
   else if (s <= 60) msg = '<strong>Moderate concern.</strong> One or more readings warrant attention. Consider ventilating if outdoor air is cleaner, or running a HEPA purifier.';
   else if (s <= 80) msg = '<strong>Elevated risk.</strong> Multiple readings are outside healthy ranges. Limit prolonged exposure, especially for children or those with respiratory conditions.';
   else              msg = '<strong>High risk - take action.</strong> Air quality is significantly degraded. Ventilate, run air purification, and consider spending time in cleaner air.';
-  if (co2 !== null && co2 > 1000) msg += ' <span class="co2-note">CO2 spike?</span> If elevated from recent cooking, it normalizes within 15-30 min of ventilation and is not a long-term concern on its own.';
+  // Name the pollutant driving the score (EPA "responsible pollutant").
+  if (result.dominant) {
+    const d = result.dominant.sensor;
+    const dTier = getThreshold(d, state[d.id]);
+    msg += ` <strong>Driven by ${d.name}</strong> (${dTier.label}).`;
+    if (result.bump >= 1) msg += ' Other elevated readings add to the cumulative load.';
+  }
+  if (co2 !== null && co2 > 1000) msg += ' <span class="co2-note">CO2 spike?</span> If elevated from recent cooking, it normalizes within 15-30 min of ventilation and is not a long-term concern on its own - CO2 does not set the overall category.';
   if (pm25 !== null && pm25 > 20) msg += ' PM2.5 is the primary driver of wildfire smoke risk - keep windows closed and run filtration continuously while outdoor AQI is elevated.';
   return msg;
 }
