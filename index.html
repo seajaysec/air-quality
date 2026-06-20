@@ -581,6 +581,25 @@ const state = {};
 SENSORS.forEach(s => { state[s.id] = null; });
 const history = [];
 
+// ── Persistence (localStorage) ───────────────────────────────────────────────────
+const STATE_KEY   = 'iaq.state.v1';
+const HISTORY_KEY = 'iaq.history.v1';
+
+function lsGet(key) {
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : null; }
+  catch { return null; } // private mode / disabled storage
+}
+function lsSet(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+function saveState()   { lsSet(STATE_KEY, state); }
+function saveHistory() { lsSet(HISTORY_KEY, history); }
+
+// Capture persisted data up front, before any save can overwrite it.
+const savedState   = lsGet(STATE_KEY);
+const savedHistory = lsGet(HISTORY_KEY);
+if (Array.isArray(savedHistory)) history.push(...savedHistory);
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function getThreshold(sensor, value) {
   for (const t of sensor.thresholds) {
@@ -845,6 +864,7 @@ function toggleDesc(id) {
 // ── Overall ────────────────────────────────────────────────────────────────────
 function updateOverall() {
   const result = computeOverall();
+  saveState();
   const scoreEl  = document.getElementById('overallScore');
   const statusEl = document.getElementById('overallStatus');
   const msgEl    = document.getElementById('overallMessage');
@@ -874,6 +894,7 @@ function logReading() {
   const now = new Date();
   const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   history.push({ time: timeStr, score: Math.round(result.score), vals: { ...state } });
+  saveHistory();
   renderHistory();
 }
 
@@ -950,16 +971,22 @@ updateOverall();
 updateClock();
 setInterval(updateClock, 1000);
 
-// Load from URL params if present, otherwise fall back to photo values
+// Prefill priority: URL params > saved localStorage state > photo defaults.
 const urlParams = new URLSearchParams(window.location.search);
 const hasUrlValues = SENSORS.some(s => urlParams.has(s.id));
-const prefill = hasUrlValues
-  ? Object.fromEntries(SENSORS.map(s => [s.id, urlParams.has(s.id) ? parseFloat(urlParams.get(s.id)) : undefined]).filter(([,v]) => v !== undefined))
-  : { co2: 460, pm25: 26, pm10: 33, pm1: 15, tvoc: 0.337, hcho: 0.006 };
+const hasSavedState = savedState && SENSORS.some(s => savedState[s.id] !== null && savedState[s.id] !== undefined);
+let prefill;
+if (hasUrlValues) {
+  prefill = Object.fromEntries(SENSORS.map(s => [s.id, urlParams.has(s.id) ? parseFloat(urlParams.get(s.id)) : undefined]).filter(([,v]) => v !== undefined));
+} else if (hasSavedState) {
+  prefill = savedState;
+} else {
+  prefill = { co2: 460, pm25: 26, pm10: 33, pm1: 15, tvoc: 0.337, hcho: 0.006 };
+}
 
 SENSORS.forEach(s => {
   const v = prefill[s.id];
-  if (v === undefined || isNaN(v)) return;
+  if (v === undefined || v === null || isNaN(v)) return;
   state[s.id] = v;
   const numEl   = document.getElementById(`num-${s.id}`);
   const rangeEl = document.getElementById(`range-${s.id}`);
@@ -968,6 +995,7 @@ SENSORS.forEach(s => {
   refreshCard(s);
 });
 updateOverall();
+renderHistory();
 </script>
 </body>
 </html>
